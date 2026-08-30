@@ -1,0 +1,16 @@
+# Secrets and user-owned integrations
+.env
+credentials.json
+token.json
+
+# Local assistant data
+data/*.db
+*.db
+memory.json
+
+# Python and build artifacts
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/

@@ -1,0 +1,378 @@
+import os, asyncio, json, threading, tempfile, uuid, webbrowser, subprocess, time
+import psutil, pyautogui, pygame, edge_tts, math, sqlite3
+from collections import deque
+from datetime import datetime, timedelta
+import customtkinter as ctk
+from openai import AsyncOpenAI # ⚠️ Upgraded to AsyncOpenAI for massive speed boosts
+
+# =========================
+# 🗄️ PERSISTENCE & MEMORY
+# =========================
+class FridayMemory:
+    def __init__(self):
+        self.db_path = "friday_core.db"
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, time TEXT, task TEXT, status TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    
+    def add_event(self, time_str, task):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO events (time, task, status) VALUES (?, ?, 'pending')", (time_str, task))
+
+    def get_due_events(self):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT id, task FROM events WHERE time <= ? AND status = 'pending'", (now,))
+            return cursor.fetchall()
+
+    def mark_event_done(self, event_id):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE events SET status = 'completed' WHERE id = ?", (event_id,))
+
+# =========================
+# ⚙️ TASK EXECUTOR
+# =========================
+class TaskExecutor:
+    @staticmethod
+    def execute(tasks):
+        results = []
+        for task in tasks:
+            action = task.get("action")
+            value = task.get("value")
+            try:
+                if action == "open_url": webbrowser.open(value)
+                elif action == "launch": subprocess.Popen(value, shell=True)
+                elif action == "type": pyautogui.write(value)
+                elif action == "press": pyautogui.press(value)
+                elif action == "sys_cmd": os.system(value)
+                results.append(f"Executed {action}")
+            except Exception as e:
+                results.append(f"Error in {action}: {str(e)}")
+        return results
+
+# =========================
+# 🧠 COGNITIVE CORE
+# =========================
+class FridayCore:
+    def __init__(self):
+        self.client = AsyncOpenAI(
+            api_key="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", # ⚠️ PUT YOUR OPENROUTER KEY HERE!
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://localhost", "X-Title": "Friday OS"}
+        )
+        self.memory = FridayMemory()
+
+    async def process_query(self, text):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prompt = f"""
+        System: You are F.R.I.D.A.Y., a highly advanced, professional American AI assistant. 
+        Current Time: {now}
+        User Intent: {text}
+
+        Rules for Extreme Speed:
+        1. Keep your verbal replies UNDER 15 WORDS. Be ruthlessly brief, direct, and snappy.
+        2. Do not use conversational filler. Provide the answer or confirm the action immediately.
+        3. Speak in a natural American tone.
+
+        Capabilities:
+        - open_url: Open websites.
+        - launch: Start local apps (e.g., 'notepad', 'calc').
+        - type: Write text via keyboard.
+        - schedule: Add event (value format: 'YYYY-MM-DD HH:MM | Task Description').
+        - sys_cmd: Execute shell commands.
+
+        Output ONLY JSON:
+        {{
+            "reply": "Extremely brief confirmation",
+            "tasks": [{{"action": "capability", "value": "data"}}]
+        }}
+        """
+        try:
+            # Now runs asynchronously, preventing the UI from freezing!
+            res = await self.client.chat.completions.create(
+                model="meta-llama/llama-3-8b-instruct",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(res.choices[0].message.content)
+            
+            for t in data.get("tasks", []):
+                if t['action'] == "schedule":
+                    time_part, task_part = t['value'].split('|')
+                    self.memory.add_event(time_part.strip(), task_part.strip())
+            
+            return data
+        except Exception as e:
+            return {"reply": f"System error: {str(e)}", "tasks": []}
+
+# =========================
+# 🎨 HUD INTERFACE (MARK 9)
+# =========================
+class FridayHUD(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("F.R.I.D.A.Y. OS")
+        self.geometry("1200x800")
+        self.configure(fg_color="#010101")
+        self.core = FridayCore()
+        
+        self.theme = {
+            "idle": "#00D4FF",        # Cyan
+            "processing": "#1E90FF",  # Deep Blue
+            "speaking": "#FF8C00"     # Orange
+        }
+        self.current_state = "idle"
+        self.frame_count = 0
+
+        # Background Grid
+        self.canvas = ctk.CTkCanvas(self, bg="#010101", highlightthickness=0)
+        self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._draw_grid()
+
+        # Terminal Log (Bottom)
+        self.terminal = ctk.CTkTextbox(self, fg_color="#050505", text_color=self.theme["idle"], 
+                                      font=("Consolas", 14), border_width=1, border_color="#111")
+        self.terminal.place(relx=0.02, rely=0.75, relwidth=0.96, relheight=0.2)
+
+        # Unified Left Sidebar
+        self.sidebar = ctk.CTkFrame(self, width=320, fg_color="#050505", border_color="#111", border_width=1)
+        self.sidebar.place(relx=0.02, rely=0.05, relheight=0.67)
+
+        # 📊 System Vitals Section
+        self.title_vitals = ctk.CTkLabel(self.sidebar, text="SYSTEM VITALS", font=("Orbitron", 14, "bold"), text_color=self.theme["idle"])
+        self.title_vitals.pack(pady=(15, 5))
+        
+        self.cpu_history = deque([0]*40, maxlen=40)
+        self.ram_history = deque([0]*40, maxlen=40)
+        self.graph_canvas = ctk.CTkCanvas(self.sidebar, height=120, bg="#0a0a0a", highlightthickness=1, highlightbackground="#222")
+        self.graph_canvas.pack(fill="x", padx=15, pady=5)
+        
+        self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.stats_frame.pack(fill="x", padx=15, pady=5)
+        self.cpu_label = self._create_stat(self.stats_frame, "CPU LOAD")
+        self.ram_label = self._create_stat(self.stats_frame, "MEMORY")
+        self.net_dl_label = self._create_stat(self.stats_frame, "NET DL")
+        self.net_ul_label = self._create_stat(self.stats_frame, "NET UL")
+
+        # 🚀 Shortcuts Section
+        self.title_links = ctk.CTkLabel(self.sidebar, text="COMMAND LINKS", font=("Orbitron", 14, "bold"), text_color=self.theme["idle"])
+        self.title_links.pack(pady=(20, 5))
+
+        self._create_btn(self.sidebar, "🎵 Launch Spotify", lambda: os.system("start spotify"))
+        self._create_btn(self.sidebar, "🌐 Chrome Browser", lambda: os.system("start chrome"))
+        self._create_btn(self.sidebar, "🧮 Calculator", lambda: os.system("start calc"))
+        self._create_btn(self.sidebar, "🛑 EXIT SYSTEM", self.destroy, color="#FF3E3E")
+
+        # 🧠 Center Text
+        self.center_text = ctk.CTkLabel(self, text="AWAITING COMMAND", font=("Orbitron", 18, "bold"), 
+                                        text_color=self.theme["idle"], bg_color="#010101")
+
+        self.last_net_io = psutil.net_io_counters()
+        self.last_net_time = time.time()
+        self._animate()
+
+    def _draw_grid(self):
+        for i in range(0, 4000, 50):
+            self.canvas.create_line(i, 0, i, 3000, fill="#080808")
+            self.canvas.create_line(0, i, 4000, i, fill="#080808")
+
+    def _create_stat(self, parent, name):
+        lbl = ctk.CTkLabel(parent, text=f"{name}: 0%", font=("Orbitron", 12), text_color=self.theme["idle"])
+        lbl.pack(anchor="w", pady=2)
+        return lbl
+
+    def _create_btn(self, parent, text, cmd, color="#00D4FF"):
+        btn = ctk.CTkButton(parent, text=text, command=cmd, fg_color="#111", hover_color="#222",
+                            border_color=color, border_width=1, text_color=color, font=("Orbitron", 12))
+        btn.pack(fill="x", padx=15, pady=6)
+
+    def _update_graphs(self):
+        self.graph_canvas.delete("graph")
+        w, h = 286, 120 
+        
+        cpu_coords = []
+        for i, val in enumerate(self.cpu_history):
+            x = i * (w / 40)
+            y = h - (val / 100 * h)
+            cpu_coords.extend([x, y])
+        if len(cpu_coords) >= 4:
+            self.graph_canvas.create_line(cpu_coords, fill="#00D4FF", width=2, tags="graph", smooth=True)
+
+        ram_coords = []
+        for i, val in enumerate(self.ram_history):
+            x = i * (w / 40)
+            y = h - (val / 100 * h)
+            ram_coords.extend([x, y])
+        if len(ram_coords) >= 4:
+            self.graph_canvas.create_line(ram_coords, fill="#FF8C00", width=2, tags="graph", smooth=True)
+
+    def _animate(self):
+        color = self.theme[self.current_state]
+        self.frame_count += 1
+        
+        self.terminal.configure(text_color=color, border_color=color)
+        self.title_vitals.configure(text_color=color)
+        self.title_links.configure(text_color=color)
+        
+        # Hardware & Graphs Updates
+        if self.frame_count % 10 == 0:
+            self.cpu_history.append(psutil.cpu_percent())
+            self.ram_history.append(psutil.virtual_memory().percent)
+            self._update_graphs()
+
+            current_net_io = psutil.net_io_counters()
+            current_time = time.time()
+            dt = current_time - self.last_net_time
+            dl_speed = (current_net_io.bytes_recv - self.last_net_io.bytes_recv) / dt / 1024 / 1024
+            ul_speed = (current_net_io.bytes_sent - self.last_net_io.bytes_sent) / dt / 1024 / 1024
+            
+            self.last_net_io = current_net_io
+            self.last_net_time = current_time
+
+            self.cpu_label.configure(text=f"CPU LOAD:  {self.cpu_history[-1]}%", text_color=color)
+            self.ram_label.configure(text=f"MEMORY:  {self.ram_history[-1]}%", text_color=color)
+            self.net_dl_label.configure(text=f"NET DOWN:  {dl_speed:.2f} MB/s", text_color=color)
+            self.net_ul_label.configure(text=f"NET UP:  {ul_speed:.2f} MB/s", text_color=color)
+
+        # Dynamic Sine Wave Animation
+        self.canvas.delete("wave")
+        t = time.time()
+        
+        win_w = self.winfo_width()
+        win_h = self.winfo_height()
+        cx = 360 + ((win_w - 360) // 2) if win_w > 400 else 700
+        cy = (win_h // 2) - 100 if win_h > 200 else 300
+        
+        self.center_text.place(x=cx, y=cy - 120, anchor="center")
+
+        if self.current_state == "idle":
+            self.center_text.configure(text="AWAITING INPUT", text_color=color)
+            amps, freq, speed = [20, 15, 10], 0.02, 3
+        elif self.current_state == "processing":
+            self.center_text.configure(text="PROCESSING...", text_color=color)
+            amps, freq, speed = [60, 45, 30], 0.05, 15
+        elif self.current_state == "speaking":
+            self.center_text.configure(text="VOCALIZING...", text_color=color)
+            amps, freq, speed = [120, 90, 60], 0.03, 10
+
+        for i, amp in enumerate(amps):
+            points = []
+            for x in range(int(cx - 250), int(cx + 250), 10):
+                y = cy + amp * math.sin(freq * (x - cx) + (t * speed) + i)
+                taper_factor = max(0, 1 - abs(x - cx) / 250)
+                y = cy + (y - cy) * taper_factor
+                points.extend([x, y])
+            
+            if len(points) >= 4:
+                self.canvas.create_line(points, fill=color, width=3-i, tags="wave", smooth=True)
+
+        self.after(30, self._animate) 
+
+    def log(self, msg):
+        self.terminal.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        self.terminal.see("end")
+
+# =========================
+# 🔊 VOICE & LOGIC LOOP
+# =========================
+async def main_loop(ui):
+    import speech_recognition as sr
+    pygame.mixer.init()
+    rec = sr.Recognizer()
+    mic = sr.Microphone()
+
+    rec.pause_threshold = 0.8  
+    rec.non_speaking_duration = 0.4
+    rec.dynamic_energy_threshold = True 
+
+    async def speak(text):
+        ui.current_state = "speaking" 
+        
+        for p in ['. ', '? ', '! ', '.\n', '?\n', '!\n']:
+            text = text.replace(p, p.strip() + '|SPLIT|')
+        chunks = [c.strip() for c in text.split('|SPLIT|') if c.strip()]
+        
+        if not chunks: 
+            ui.current_state = "idle"
+            return
+
+        audio_queue = asyncio.Queue()
+        generated_files = []
+
+        async def tts_generator():
+            for chunk in chunks:
+                path = os.path.join(tempfile.gettempdir(), f"fri_{uuid.uuid4()}.mp3")
+                try:
+                    await edge_tts.Communicate(chunk, "en-US-AriaNeural", rate="+15%").save(path)
+                    generated_files.append(path)
+                    await audio_queue.put((path, chunk)) 
+                except Exception as e:
+                    ui.log(f"TTS Error: {e}")
+            await audio_queue.put((None, None))
+
+        asyncio.create_task(tts_generator())
+
+        try:
+            while True:
+                if not pygame.mixer.music.get_busy():
+                    path, chunk_text = await audio_queue.get()
+                    if path is None: break 
+                        
+                    ui.log(f"FRIDAY: {chunk_text}") 
+                    pygame.mixer.music.load(path)
+                    pygame.mixer.music.play()
+                
+                await asyncio.sleep(0.05) 
+        finally:
+            ui.current_state = "idle"
+            pygame.mixer.music.unload() 
+            for f in generated_files:
+                try: os.remove(f)
+                except: pass
+
+    ui.current_state = "speaking"
+    # THE FIX: We must `await` the speech so she finishes talking before listening again!
+    await speak("System initialized. High-speed unified interface loaded.")
+
+    while True:
+        due = ui.core.memory.get_due_events()
+        for event_id, task in due:
+            await speak(f"Reminder: {task}")
+            ui.core.memory.mark_event_done(event_id)
+
+        with mic as source:
+            rec.adjust_for_ambient_noise(source, duration=0.2) 
+            try:
+                audio = rec.listen(source, timeout=1.5, phrase_time_limit=15)
+                ui.current_state = "processing" 
+                
+                # THE FIX: Offload Google STT to a separate thread so it doesn't freeze the app!
+                query = await asyncio.to_thread(rec.recognize_google, audio)
+                query = query.lower()
+                
+                if "friday" in query:
+                    ui.log(f"User: {query}")
+                    data = await ui.core.process_query(query)
+                    
+                    TaskExecutor.execute(data.get('tasks', []))
+                    
+                    # THE FIX: Wait for her to finish speaking before listening again to prevent overlapping!
+                    await speak(data['reply'])
+                else:
+                    ui.current_state = "idle"
+                    
+            except sr.WaitTimeoutError: ui.current_state = "idle"
+            except sr.UnknownValueError: ui.current_state = "idle"
+            except Exception as e:
+                ui.log(f"System Warning: {e}")
+                ui.current_state = "idle"
+        
+        await asyncio.sleep(0.05)
+
+if __name__ == "__main__":
+    app = FridayHUD()
+    threading.Thread(target=lambda: asyncio.run(main_loop(app)), daemon=True).start()
+    app.mainloop()

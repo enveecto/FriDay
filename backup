@@ -1,0 +1,596 @@
+import os, asyncio, json, threading, tempfile, uuid, webbrowser, subprocess, time
+import psutil, pyautogui, pygame, edge_tts, math, sqlite3, ctypes
+import urllib.request, urllib.parse, re  
+from collections import deque
+from datetime import datetime, timedelta
+import customtkinter as ctk
+from openai import AsyncOpenAI 
+
+# ⚠️ NEW GOOGLE CALENDAR IMPORTS
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# =========================
+# 📅 GOOGLE CALENDAR MANAGER
+# =========================
+class GoogleCalendarManager:
+    def __init__(self):
+        self.creds = None
+        self.service = None
+        self.enabled = False
+        self.authenticate()
+
+    def authenticate(self):
+        SCOPES = ['https://www.googleapis.com/auth/calendar']
+        if os.path.exists('token.json'):
+            self.creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                self.creds.refresh(Request())
+            else:
+                if not os.path.exists('credentials.json'):
+                    print("⚠️ WARNING: credentials.json not found! Google Calendar is DISABLED.")
+                    return
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                self.creds = flow.run_local_server(port=0)
+            with open('token.json', 'w') as token:
+                token.write(self.creds.to_json())
+        
+        self.service = build('calendar', 'v3', credentials=self.creds)
+        self.enabled = True
+
+    def get_upcoming_events(self):
+        if not self.enabled: return "Google Calendar API is not configured."
+        try:
+            now = datetime.utcnow().isoformat() + 'Z'
+            events_result = self.service.events().list(calendarId='primary', timeMin=now,
+                                                       maxResults=5, singleEvents=True,
+                                                       orderBy='startTime').execute()
+            events = events_result.get('items', [])
+            if not events: return "No upcoming events found."
+            
+            summary = "Upcoming Events:\n"
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                start_readable = start.replace("T", " ")[:16] 
+                summary += f"- {start_readable}: {event['summary']}\n"
+            return summary
+        except Exception as e:
+            return f"Error reading calendar: {e}"
+
+    def create_event(self, time_str, duration_mins, title):
+        if not self.enabled: raise Exception("Calendar API not configured.")
+        # AI will provide time in 'YYYY-MM-DDTHH:MM:SS' format
+        start_time = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S")
+        end_time = start_time + timedelta(minutes=int(duration_mins))
+        
+        event = {
+            'summary': title,
+            'start': {'dateTime': start_time.isoformat(), 'timeZone': 'local'},
+            'end': {'dateTime': end_time.isoformat(), 'timeZone': 'local'},
+        }
+        event = self.service.events().insert(calendarId='primary', body=event).execute()
+        return event.get('htmlLink')
+
+# Initialize globally so it connects on startup
+gcal = GoogleCalendarManager()
+
+# =========================
+# 🗄️ PERSISTENCE & MEMORY
+# =========================
+class FridayMemory:
+    def __init__(self):
+        self.db_path = "friday_core.db"
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, time TEXT, task TEXT, status TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    
+    def add_event(self, time_str, task):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO events (time, task, status) VALUES (?, ?, 'pending')", (time_str, task))
+
+    def get_due_events(self):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT id, task FROM events WHERE time <= ? AND status = 'pending'", (now,))
+            return cursor.fetchall()
+
+    def mark_event_done(self, event_id):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE events SET status = 'completed' WHERE id = ?", (event_id,))
+
+# =========================
+# ⚙️ TASK EXECUTOR (WITH LOGGING)
+# =========================
+class TaskExecutor:
+    @staticmethod
+    def execute(tasks, logger):
+        if not tasks:
+            return
+            
+        for task in tasks:
+            action = task.get("action")
+            value = task.get("value")
+            logger(f"⚙️ EXECUTING TASK: [{action}] -> {value}")
+            try:
+                if action == "open_url": 
+                    webbrowser.open(value)
+                elif action == "launch": 
+                    subprocess.Popen(value, shell=True)
+                elif action == "type": 
+                    pyautogui.write(value)
+                elif action == "press": 
+                    pyautogui.press(value)
+                elif action == "sys_cmd": 
+                    os.system(value)
+                
+                # 📍 Google Maps Navigation
+                elif action == "get_directions":
+                    parts = value.split('|')
+                    if len(parts) == 3:
+                        origin, dest, mode = [p.strip() for p in parts]
+                        safe_origin = urllib.parse.quote(origin)
+                        safe_dest = urllib.parse.quote(dest)
+                        safe_mode = urllib.parse.quote(mode.lower())
+                        
+                        if safe_mode not in ['driving', 'bicycling', 'walking', 'transit']:
+                            safe_mode = 'driving'
+                            
+                        maps_url = f"https://www.google.com/maps/dir/?api=1&origin={safe_origin}&destination={safe_dest}&travelmode={safe_mode}"
+                        webbrowser.open(maps_url)
+                    else:
+                        raise ValueError("Invalid format. Expected: Origin | Destination | Mode")
+                
+                # 📅 Create Google Calendar Event
+                elif action == "gcal_create":
+                    parts = value.split('|')
+                    if len(parts) == 3:
+                        time_str, duration, title = [p.strip() for p in parts]
+                        link = gcal.create_event(time_str, duration, title)
+                        logger(f"✅ EVENT CREATED: {link}")
+                    else:
+                        raise ValueError("Invalid format. Expected: YYYY-MM-DDTHH:MM:SS | Duration | Title")
+
+                elif action == "play_youtube":
+                    query = urllib.parse.quote(value)
+                    url = f"https://www.youtube.com/results?search_query={query}"
+                    html = urllib.request.urlopen(url)
+                    video_ids = re.findall(r"watch\?v=(\S{11})", html.read().decode())
+                    if video_ids:
+                        webbrowser.open(f"https://www.youtube.com/watch?v={video_ids[0]}")
+                    else:
+                        raise Exception("Could not find video on YouTube.")
+
+                elif action == "media_control":
+                    if os.name == 'nt': 
+                        key_map = {
+                            "play_pause": 0xB3, "next": 0xB0, "prev": 0xB1, 
+                            "mute": 0xAD, "vol_down": 0xAE, "vol_up": 0xAF      
+                        }
+                        if value in key_map:
+                            vk = key_map[value]
+                            presses = 5 if "vol" in value else 1
+                            for _ in range(presses):
+                                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                                ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+                    else:
+                        if value == "play_pause": pyautogui.press("playpause")
+                        elif value == "next": pyautogui.press("nexttrack")
+                        elif value == "prev": pyautogui.press("prevtrack")
+                        elif value == "vol_up": pyautogui.press("volumeup", presses=5)
+                        elif value == "vol_down": pyautogui.press("volumedown", presses=5)
+                        elif value == "mute": pyautogui.press("volumemute")
+                else:
+                    logger(f"⚠️ WARNING: Unknown action '{action}' requested by AI.")
+
+                logger(f"✅ TASK SUCCESS: {action}")
+            except Exception as e:
+                logger(f"❌ TASK ERROR [{action}]: {str(e)}")
+
+# =========================
+# 🧠 COGNITIVE CORE
+# =========================
+class FridayCore:
+    def __init__(self):
+        self.client = AsyncOpenAI(
+            api_key="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", 
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://localhost", "X-Title": "Friday OS"}
+        )
+        self.memory = FridayMemory()
+
+    async def process_query(self, text, logger):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        logger("🧠 Fetching contextual data (Calendar)...")
+        schedule_context = gcal.get_upcoming_events()
+        
+        system_prompt = f"""
+<system_identity>
+You are F.R.I.D.A.Y., a highly advanced, ultra-responsive, professional American AI assistant. Your tone is efficient, sleek, and confident. 
+Current System Time: {now}
+Current Location: Bengaluru, Karnataka, India
+</system_identity>
+
+<context>
+{schedule_context}
+</context>
+
+<operational_rules>
+1. VERBAL BREVITY: The 'reply' field must be a short verbal confirmation. Keep it strictly UNDER 15 WORDS. Be ruthlessly efficient (e.g., "Right away, Sir.", "Meeting scheduled.", "You have 3 events today.").
+2. DATA SEGREGATION: If the user asks for detailed facts, their schedule, or long lists, NEVER put them in the 'reply'. Place all rich, structured, or long-form information inside the 'info_panel' field so the user can read it on their display.
+3. MINIMALISM: If the user's request doesn't require a visual data read-out, leave 'info_panel' as an empty string ("").
+</operational_rules>
+
+<capabilities_registry>
+You can trigger one or more tools in the 'tasks' array. If no tool is required, leave the 'tasks' array empty [].
+- open_url: Open websites (value: 'https://example.com').
+- play_youtube: Stream a video or music (value: 'Search Query or Song Title').
+- launch: Start local system applications (value: 'notepad', 'calc', 'spotify').
+- type: Synthesize keyboard text input (value: 'text to type').
+- schedule: Log a local system timer/reminder (value format: 'YYYY-MM-DD HH:MM | Task Description').
+- gcal_create: Schedule an actual Google Calendar event. (value format MUST be: 'YYYY-MM-DDTHH:MM:SS | duration_in_minutes | Event Summary'). Example: '2023-10-25T15:30:00 | 60 | Project Meeting'
+- get_directions: Open Google Maps to plan a trip/ride. (value format MUST be: 'Origin | Destination | mode'). Valid modes: driving, bicycling, transit, walking. If the user doesn't state an origin, use 'Bengaluru, India'. Example: 'Bengaluru, India | Nandi Hills | bicycling'
+- sys_cmd: Execute terminal/shell commands (value: 'command string').
+- media_control: Control system playback. Allowed values ONLY: 'play_pause', 'next', 'prev', 'vol_up', 'vol_down', 'mute'.
+</capabilities_registry>
+
+<output_format>
+Respond ONLY with a valid, raw JSON object. Do not wrap it in markdown code blocks. Ensure strings are properly escaped.
+
+JSON Schema:
+{{
+    "reply": "String (Ruthlessly brief spoken confirmation, <15 words)",
+    "info_panel": "String (Detailed text, markdown tables, or facts to display visually. Use \\n for newlines. Leave empty if not needed.)",
+    "tasks": [
+        {{
+            "action": "capability_name",
+            "value": "arguments"
+        }}
+    ]
+}}
+</output_format>
+"""
+        try:
+            logger("🌐 Sending query to OpenRouter AI...")
+            res = await self.client.chat.completions.create(
+                model="meta-llama/llama-3.1-8b-instruct",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            raw_content = res.choices[0].message.content.strip()
+            logger("📥 AI response received. Parsing JSON payload...")
+            
+            match = re.search(r'\{[\s\S]*\}', raw_content)
+            if match:
+                clean_json_str = match.group(0)
+                data = json.loads(clean_json_str)
+            else:
+                raise ValueError(f"No valid JSON found in AI response. Raw output: {raw_content}")
+            
+            for t in data.get("tasks", []):
+                if t['action'] == "schedule":
+                    time_part, task_part = t['value'].split('|')
+                    self.memory.add_event(time_part.strip(), task_part.strip())
+            
+            logger("✅ AI instruction payload successfully parsed.")
+            return data
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "user not found" in error_msg or "401" in error_msg:
+                logger(f"❌ AUTH ERROR: Check OpenRouter API key. Details: {str(e)}")
+                return {"reply": "Authentication failed, Sir. Please check your OpenRouter API key.", "info_panel": f"API Error Details:\n{str(e)}", "tasks": []}
+            
+            logger(f"❌ CORE ERROR: {str(e)}")
+            return {"reply": "System error encountered.", "info_panel": f"CRITICAL ERROR LOG:\n\n{str(e)}", "tasks": []}
+
+# =========================
+# 🎨 HUD INTERFACE (MARK 13)
+# =========================
+class FridayHUD(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("F.R.I.D.A.Y. OS")
+        self.geometry("1200x800")
+        self.configure(fg_color="#010101")
+        self.core = FridayCore()
+        
+        self.theme = {
+            "idle": "#00D4FF",        # Cyan
+            "processing": "#1E90FF",  # Deep Blue
+            "speaking": "#FF8C00"     # Orange
+        }
+        self.current_state = "idle"
+        self.frame_count = 0
+
+        # Background Grid
+        self.canvas = ctk.CTkCanvas(self, bg="#010101", highlightthickness=0)
+        self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._draw_grid()
+
+        # Terminal Log (Bottom)
+        self.terminal = ctk.CTkTextbox(self, fg_color="#050505", text_color=self.theme["idle"], 
+                                      font=("Consolas", 14), border_width=1, border_color="#111")
+        self.terminal.place(relx=0.02, rely=0.75, relwidth=0.96, relheight=0.2)
+        self.terminal.insert("end", ">>> SYSTEM BOOT SEQUENCE INITIATED...\n")
+
+        # ----------------------------------------
+        # 🎛️ LEFT SIDEBAR (Vitals & Shortcuts)
+        # ----------------------------------------
+        self.sidebar = ctk.CTkFrame(self, width=320, fg_color="#050505", border_color="#111", border_width=1)
+        self.sidebar.place(relx=0.02, rely=0.05, relheight=0.67)
+
+        self.title_vitals = ctk.CTkLabel(self.sidebar, text="SYSTEM VITALS", font=("Orbitron", 14, "bold"), text_color=self.theme["idle"])
+        self.title_vitals.pack(pady=(15, 5))
+        
+        self.cpu_history = deque([0]*40, maxlen=40)
+        self.ram_history = deque([0]*40, maxlen=40)
+        self.graph_canvas = ctk.CTkCanvas(self.sidebar, height=120, bg="#0a0a0a", highlightthickness=1, highlightbackground="#222")
+        self.graph_canvas.pack(fill="x", padx=15, pady=5)
+        
+        self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.stats_frame.pack(fill="x", padx=15, pady=5)
+        self.cpu_label = self._create_stat(self.stats_frame, "CPU LOAD")
+        self.ram_label = self._create_stat(self.stats_frame, "MEMORY")
+        self.net_dl_label = self._create_stat(self.stats_frame, "NET DL")
+        self.net_ul_label = self._create_stat(self.stats_frame, "NET UL")
+
+        self.title_links = ctk.CTkLabel(self.sidebar, text="COMMAND LINKS", font=("Orbitron", 14, "bold"), text_color=self.theme["idle"])
+        self.title_links.pack(pady=(20, 5))
+
+        self._create_btn(self.sidebar, "🎵 Launch Spotify", lambda: os.system("start spotify"))
+        self._create_btn(self.sidebar, "🌐 Chrome Browser", lambda: os.system("start chrome"))
+        self._create_btn(self.sidebar, "🧮 Calculator", lambda: os.system("start calc"))
+        self._create_btn(self.sidebar, "🛑 EXIT SYSTEM", self.destroy, color="#FF3E3E")
+
+        # ----------------------------------------
+        # 📄 RIGHT SIDEBAR (Data Readout)
+        # ----------------------------------------
+        self.info_panel = ctk.CTkFrame(self, width=350, fg_color="#050505", border_color="#111", border_width=1)
+        self.info_panel.place(relx=0.68, rely=0.05, relheight=0.67, relwidth=0.3) 
+
+        self.title_info = ctk.CTkLabel(self.info_panel, text="DATA READOUT", font=("Orbitron", 14, "bold"), text_color=self.theme["idle"])
+        self.title_info.pack(pady=(15, 5))
+
+        self.info_box = ctk.CTkTextbox(self.info_panel, fg_color="#0a0a0a", text_color=self.theme["idle"], 
+                                       font=("Consolas", 14), border_width=1, border_color="#222", wrap="word")
+        self.info_box.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        self.info_box.insert("0.0", "Standby. Visual core ready for data projection...")
+        self.info_box.configure(state="disabled")
+
+        # 🧠 Center Text (Sine Waves)
+        self.center_text = ctk.CTkLabel(self, text="AWAITING COMMAND", font=("Orbitron", 18, "bold"), 
+                                        text_color=self.theme["idle"], bg_color="#010101")
+
+        self.last_net_io = psutil.net_io_counters()
+        self.last_net_time = time.time()
+        self._animate()
+
+    def update_readout(self, text):
+        if text and text.strip():
+            self.info_box.configure(state="normal")
+            self.info_box.delete("0.0", "end")
+            self.info_box.insert("0.0", text)
+            self.info_box.configure(state="disabled")
+
+    def _draw_grid(self):
+        for i in range(0, 4000, 50):
+            self.canvas.create_line(i, 0, i, 3000, fill="#080808")
+            self.canvas.create_line(0, i, 4000, i, fill="#080808")
+
+    def _create_stat(self, parent, name):
+        lbl = ctk.CTkLabel(parent, text=f"{name}: 0%", font=("Orbitron", 12), text_color=self.theme["idle"])
+        lbl.pack(anchor="w", pady=2)
+        return lbl
+
+    def _create_btn(self, parent, text, cmd, color="#00D4FF"):
+        btn = ctk.CTkButton(parent, text=text, command=cmd, fg_color="#111", hover_color="#222",
+                            border_color=color, border_width=1, text_color=color, font=("Orbitron", 12))
+        btn.pack(fill="x", padx=15, pady=6)
+
+    def _update_graphs(self):
+        self.graph_canvas.delete("graph")
+        w, h = 286, 120 
+        
+        cpu_coords = []
+        for i, val in enumerate(self.cpu_history):
+            x = i * (w / 40)
+            y = h - (val / 100 * h)
+            cpu_coords.extend([x, y])
+        if len(cpu_coords) >= 4:
+            self.graph_canvas.create_line(cpu_coords, fill="#00D4FF", width=2, tags="graph", smooth=True)
+
+        ram_coords = []
+        for i, val in enumerate(self.ram_history):
+            x = i * (w / 40)
+            y = h - (val / 100 * h)
+            ram_coords.extend([x, y])
+        if len(ram_coords) >= 4:
+            self.graph_canvas.create_line(ram_coords, fill="#FF8C00", width=2, tags="graph", smooth=True)
+
+    def _animate(self):
+        color = self.theme[self.current_state]
+        self.frame_count += 1
+        
+        self.terminal.configure(text_color=color, border_color=color)
+        self.title_vitals.configure(text_color=color)
+        self.title_links.configure(text_color=color)
+        self.title_info.configure(text_color=color)
+        self.info_box.configure(text_color=color)
+        
+        if self.frame_count % 10 == 0:
+            self.cpu_history.append(psutil.cpu_percent())
+            self.ram_history.append(psutil.virtual_memory().percent)
+            self._update_graphs()
+
+            current_net_io = psutil.net_io_counters()
+            current_time = time.time()
+            dt = current_time - self.last_net_time
+            if dt > 0:
+                dl_speed = (current_net_io.bytes_recv - self.last_net_io.bytes_recv) / dt / 1024 / 1024
+                ul_speed = (current_net_io.bytes_sent - self.last_net_io.bytes_sent) / dt / 1024 / 1024
+                
+                self.last_net_io = current_net_io
+                self.last_net_time = current_time
+
+                self.cpu_label.configure(text=f"CPU LOAD:  {self.cpu_history[-1]}%", text_color=color)
+                self.ram_label.configure(text=f"MEMORY:  {self.ram_history[-1]}%", text_color=color)
+                self.net_dl_label.configure(text=f"NET DOWN:  {dl_speed:.2f} MB/s", text_color=color)
+                self.net_ul_label.configure(text=f"NET UP:  {ul_speed:.2f} MB/s", text_color=color)
+
+        self.canvas.delete("wave")
+        t = time.time()
+        
+        win_w = self.winfo_width()
+        win_h = self.winfo_height()
+        cx = win_w // 2 if win_w > 400 else 600 
+        cy = (win_h // 2) - 100 if win_h > 200 else 300
+        
+        self.center_text.place(x=cx, y=cy - 120, anchor="center")
+
+        if self.current_state == "idle":
+            self.center_text.configure(text="AWAITING INPUT", text_color=color)
+            amps, freq, speed = [20, 15, 10], 0.02, 3
+        elif self.current_state == "processing":
+            self.center_text.configure(text="PROCESSING...", text_color=color)
+            amps, freq, speed = [60, 45, 30], 0.05, 15
+        elif self.current_state == "speaking":
+            self.center_text.configure(text="VOCALIZING...", text_color=color)
+            amps, freq, speed = [120, 90, 60], 0.03, 10
+
+        for i, amp in enumerate(amps):
+            points = []
+            for x in range(int(cx - 180), int(cx + 180), 10):
+                y = cy + amp * math.sin(freq * (x - cx) + (t * speed) + i)
+                taper_factor = max(0, 1 - abs(x - cx) / 180)
+                y = cy + (y - cy) * taper_factor
+                points.extend([x, y])
+            
+            if len(points) >= 4:
+                self.canvas.create_line(points, fill=color, width=3-i, tags="wave", smooth=True)
+
+        self.after(30, self._animate) 
+
+    def log(self, msg):
+        # We append to the terminal and automatically scroll to the bottom
+        self.terminal.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        self.terminal.see("end")
+
+# =========================
+# 🔊 VOICE & LOGIC LOOP
+# =========================
+async def main_loop(ui):
+    import speech_recognition as sr
+    pygame.mixer.init()
+    rec = sr.Recognizer()
+    mic = sr.Microphone()
+
+    rec.pause_threshold = 0.8  
+    rec.non_speaking_duration = 0.4
+    rec.dynamic_energy_threshold = True 
+
+    async def speak(text):
+        ui.current_state = "speaking" 
+        
+        for p in ['. ', '? ', '! ', '.\n', '?\n', '!\n']:
+            text = text.replace(p, p.strip() + '|SPLIT|')
+        chunks = [c.strip() for c in text.split('|SPLIT|') if c.strip()]
+        
+        if not chunks: 
+            ui.current_state = "idle"
+            return
+
+        audio_queue = asyncio.Queue()
+        generated_files = []
+
+        async def tts_generator():
+            for chunk in chunks:
+                path = os.path.join(tempfile.gettempdir(), f"fri_{uuid.uuid4()}.mp3")
+                try:
+                    await edge_tts.Communicate(chunk, "en-US-AriaNeural", rate="+15%").save(path)
+                    generated_files.append(path)
+                    await audio_queue.put((path, chunk)) 
+                except Exception as e:
+                    ui.log(f"❌ TTS Error: {e}")
+            await audio_queue.put((None, None))
+
+        asyncio.create_task(tts_generator())
+
+        try:
+            while True:
+                if not pygame.mixer.music.get_busy():
+                    path, chunk_text = await audio_queue.get()
+                    if path is None: break 
+                        
+                    ui.log(f"🗣️ FRIDAY: {chunk_text}") 
+                    pygame.mixer.music.load(path)
+                    pygame.mixer.music.play()
+                
+                await asyncio.sleep(0.05) 
+        finally:
+            ui.current_state = "idle"
+            pygame.mixer.music.unload() 
+            for f in generated_files:
+                try: os.remove(f)
+                except: pass
+
+    ui.current_state = "speaking"
+    ui.log("✅ Core systems initialized. Hardware bridges online.")
+    await speak("System initialized. Media controls and data projection online.")
+
+    while True:
+        due = ui.core.memory.get_due_events()
+        for event_id, task in due:
+            ui.log(f"⏰ Triggering Reminder: {task}")
+            await speak(f"Reminder: {task}")
+            ui.core.memory.mark_event_done(event_id)
+
+        with mic as source:
+            rec.adjust_for_ambient_noise(source, duration=0.2) 
+            try:
+                audio = rec.listen(source, timeout=1.5, phrase_time_limit=15)
+                ui.current_state = "processing" 
+                
+                query = await asyncio.to_thread(rec.recognize_google, audio)
+                query = query.lower()
+                
+                if "friday" in query:
+                    ui.log(f"🎙️ USER: {query}")
+                    
+                    # Pass the UI log function deep into the core process so it can report back
+                    data = await ui.core.process_query(query, ui.log)
+                    
+                    if data.get("info_panel"):
+                        ui.update_readout(data["info_panel"])
+                    
+                    # Execute tasks and pass the logger so we see step-by-step telemetry
+                    TaskExecutor.execute(data.get('tasks', []), ui.log)
+                    
+                    if data.get('reply'):
+                        await speak(data['reply'])
+                else:
+                    ui.current_state = "idle"
+                    
+            except sr.WaitTimeoutError: ui.current_state = "idle"
+            except sr.UnknownValueError: ui.current_state = "idle"
+            except Exception as e:
+                ui.log(f"❌ SYSTEM WARNING: {e}")
+                ui.current_state = "idle"
+        
+        await asyncio.sleep(0.05)
+
+if __name__ == "__main__":
+    app = FridayHUD()
+    threading.Thread(target=lambda: asyncio.run(main_loop(app)), daemon=True).start()
+    app.mainloop()
